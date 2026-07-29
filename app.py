@@ -18,7 +18,7 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # -------------------------------------------------------------
-# FLASK WEB SERVER (Render 24/7 Alive Thread)
+# FLASK WEB SERVER (Hugging Face / Render Health Check & Uptime)
 # -------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -27,7 +27,8 @@ def health_check():
     return "Bot is alive and running 24/7!", 200
 
 def run_flask_in_background():
-    port = int(os.environ.get("PORT", 10000))
+    # Hugging Face Spaces defaults to port 7860
+    port = int(os.environ.get("PORT", 7860))
     flask_app.run(host="0.0.0.0", port=port)
 
 # -------------------------------------------------------------
@@ -44,13 +45,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # MongoDB Connection
-client = MongoClient(MONGO_URI)
-db = client['telegram_bot_db']
-users_col = db['users']
-media_col = db['media_logs']
-stats_col = db['stats']
+client = MongoClient(MONGO_URI) if MONGO_URI else None
+if client:
+    db = client['telegram_bot_db']
+    users_col = db['users']
+    media_col = db['media_logs']
+    stats_col = db['stats']
 
-# Broad RegEx Pattern (SABHI TERAH KI LINKS & DOMAINS KO CATCH KARNE KE LIYE)
+# Broad RegEx Pattern
 ALL_URL_REGEX = r'((https?://|www\.)[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[^\s]*)?|t\.me/[^\s]+|telegram\.me/[^\s]+)'
 
 # Helper Functions for Multi-Group Parsing
@@ -71,14 +73,14 @@ def get_target_group_ids():
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user:
+    if user and client:
         users_col.update_one(
             {"user_id": user.id},
             {"$set": {"user_id": user.id, "name": user.full_name, "joined_at": datetime.utcnow()}},
             upsert=True
         )
     await update.message.reply_text(
-        f"Namaste {user.first_name}! Main aapka Group Manager & Gemini AI Assistant Bot hoon.\n"
+        f"Namaste {user.first_name if user else 'Dost'}! Main aapka Group Manager & Gemini AI Assistant Bot hoon.\n"
         f"Aap bot database mein successfully registered hain!"
     )
 
@@ -86,7 +88,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     result = update.chat_member
     if result.old_chat_member.status in ["left", "kicked"] and result.new_chat_member.status == "member":
         user = result.new_chat_member.user
-        stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
+        if client:
+            stats_col.update_one({"_id": "total_joins"}, {"$inc": {"count": 1}}, upsert=True)
 
         user_mention = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
         welcome_text = (
@@ -105,8 +108,18 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 # -------------------------------------------------------------
-# 2. GEMINI AI AUTO-REPLY SYSTEM
+# 2. GEMINI AI AUTO-REPLY SYSTEM (Non-blocking)
 # -------------------------------------------------------------
+def sync_generate_gemini(prompt: str):
+    """Helper to run Gemini API in a separate thread."""
+    return ai_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={
+            "system_instruction": "Aap ek friendly, smart aur helpful Telegram Assistant hain. Koi bhi question puchne par concise (chota) aur clear Hinglish mein jawab dein."
+        }
+    )
+
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text or not ai_client:
@@ -131,21 +144,16 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
 
         try:
-            response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={
-                    "system_instruction": "Aap ek friendly, smart aur helpful Telegram Assistant hain. Koi bhi question puchne par concise (chota) aur clear Hinglish mein jawab dein."
-                }
-            )
-            if response.text:
+            # Async execution using thread to prevent bot freeze
+            response = await asyncio.to_thread(sync_generate_gemini, prompt)
+            if response and response.text:
                 await msg.reply_text(response.text)
         except Exception as e:
             print(f"Gemini AI Error: {e}")
             await msg.reply_text("Kuch technical issue aa gaya, thodi der baad try karein!")
 
 # -------------------------------------------------------------
-# 3. ADVANCED ADMIN ACTIONS (Make Admin & Add Member)
+# 3. ADVANCED ADMIN ACTIONS
 # -------------------------------------------------------------
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -190,7 +198,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.add_chat_members(chat_id=chat.id, user_ids=[user_identifier])
         await msg.reply_text(f"✅ Member {user_identifier} group mein add ho gaya!")
     except Exception as e:
-        await msg.reply_text(f"❌ User add nahi ho saka: {e}\n(User ki privacy settings block kar sakti hain).")
+        await msg.reply_text(f"❌ User add nahi ho saka: {e}\n(Note: User privacy settings or Telegram API limits can block adding members directly).")
 
 # -------------------------------------------------------------
 # 4. ALL LINKS ERASER & LOG FORWARDING HANDLER
@@ -234,7 +242,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=msg.message_id
                 )
                 
-                # Step B: Detailed Log with Group Name & ID
+                # Step B: Detailed Log
                 log_info = (
                     f"⚠️ **Deleted Link Alert**\n\n"
                     f"📢 **Group Name:** `{chat_title}`\n"
@@ -258,7 +266,7 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.message
     source_ids = get_source_group_ids()
 
-    if msg and msg.chat.id in source_ids and (msg.photo or msg.video):
+    if msg and msg.chat.id in source_ids and (msg.photo or msg.video) and client:
         media_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id
         media_type = "photo" if msg.photo else "video"
         
@@ -269,6 +277,8 @@ async def fetch_source_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def auto_post_media_job(context: ContextTypes.DEFAULT_TYPE):
+    if not client:
+        return
     target_ids = get_target_group_ids()
     if not target_ids:
         return
@@ -298,9 +308,9 @@ async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    dm_users = users_col.count_documents({})
-    joins_data = stats_col.find_one({"_id": "total_joins"}) or {"count": 0}
-    media_pending = media_col.count_documents({"sent": False})
+    dm_users = users_col.count_documents({}) if client else 0
+    joins_data = (stats_col.find_one({"_id": "total_joins"}) if client else None) or {"count": 0}
+    media_pending = media_col.count_documents({"sent": False}) if client else 0
     sources = get_source_group_ids()
     targets = get_target_group_ids()
 
@@ -329,7 +339,7 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Group Broadcast: `/send_group Message`", parse_mode="Markdown")
 
 async def broadcast_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID or not client:
         return
     text = " ".join(context.args)
     if not text:
@@ -375,6 +385,7 @@ def main():
         print("Error: BOT_TOKEN missing!")
         return
 
+    # Start Flask Web Server in Thread for Uptime Monitoring
     threading.Thread(target=run_flask_in_background, daemon=True).start()
     print("🌐 Background Flask Server Started!")
 
