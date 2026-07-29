@@ -18,7 +18,7 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # -------------------------------------------------------------
-# FLASK WEB SERVER (Hugging Face / Render Health Check & Uptime)
+# FLASK WEB SERVER (Render 24/7 Alive & Health Check)
 # -------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -27,8 +27,8 @@ def health_check():
     return "Bot is alive and running 24/7!", 200
 
 def run_flask_in_background():
-    # Hugging Face Spaces defaults to port 7860
-    port = int(os.environ.get("PORT", 7860))
+    # Render binds automatically to the PORT environment variable
+    port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
 # -------------------------------------------------------------
@@ -111,7 +111,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # 2. GEMINI AI AUTO-REPLY SYSTEM (Non-blocking)
 # -------------------------------------------------------------
 def sync_generate_gemini(prompt: str):
-    """Helper to run Gemini API in a separate thread."""
+    """Helper function to execute API call in a separate thread so bot doesn't freeze."""
     return ai_client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
@@ -144,7 +144,7 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
 
         try:
-            # Async execution using thread to prevent bot freeze
+            # Running Gemini call asynchronously in background thread
             response = await asyncio.to_thread(sync_generate_gemini, prompt)
             if response and response.text:
                 await msg.reply_text(response.text)
@@ -385,7 +385,7 @@ def main():
         print("Error: BOT_TOKEN missing!")
         return
 
-    # Start Flask Web Server in Thread for Uptime Monitoring
+    # Background Thread for Flask Health Check Server
     threading.Thread(target=run_flask_in_background, daemon=True).start()
     print("🌐 Background Flask Server Started!")
 
